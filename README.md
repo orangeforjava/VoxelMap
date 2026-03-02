@@ -3,6 +3,21 @@
 ## Introduction
 **VoxelMap** is an efficient and probabilistic adaptive(coarse-to-fine) voxel mapping method for 3D LiDAR. Unlike the point cloud map, VoxelMap uses planes as representation units. A scan of LiDAR data will generate or update the plane. Each plane contains its own plane parameters and uncertainties that need to be estimated. This repo shows how to integrate VoxelMap into a LiDAR odometry.
 
+### R-VoxelMap
+This repository also includes an implementation of **R-VoxelMap**, a novel voxel mapping method that constructs accurate voxel maps using a geometry-driven recursive plane fitting strategy. R-VoxelMap addresses VoxelMap's limitations of outlier sensitivity, plane over-segmentation, and incorrect plane merging through:
+
+1. **RANSAC-based plane fitting**: Uses Random Sample Consensus to separate inliers from outliers during plane extraction, reducing the influence of outliers on plane parameters.
+2. **Point distribution-based plane validity check**: Projects inlier points onto the fitted plane, clusters them using BFS on a 2D grid, and selects the largest geometrically consistent cluster to prevent erroneous merging of different physical planes.
+3. **Recursive outlier detect-and-reuse pipeline**: Outliers identified by RANSAC and the validity check are propagated to deeper octree levels for recursive processing, preserving multi-scale geometric information.
+
+To enable R-VoxelMap, set `use_ransac: true` in the mapping section of the configuration YAML file. Key R-VoxelMap parameters:
+- `ransac_dist_threshold`: RANSAC distance threshold for inlier classification (default: 0.1)
+- `ransac_inlier_ratio`: Minimum inlier ratio for plane acceptance (default: 0.5)
+- `ransac_iterations`: Number of RANSAC iterations (default: 50)
+- `validity_check_n`: Grid discretization parameter for validity check (default: 5)
+
+Reference paper: [R-VoxelMap: Accurate Voxel Mapping with Recursive Plane Fitting for Online LiDAR Odometry](https://arxiv.org/abs/2601.12377)
+
 <div align="center">
     <img src="pics/kitti_mapping.png" width = 100% >
     <font color=#a0a0a0 size=2>The plane map constructed by VoxelMap on KITTI Odometry sequence 00.</font>

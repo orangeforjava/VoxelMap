@@ -18,6 +18,12 @@ mapping:
     plannar_threshold: 0.01
     max_points_size: 200
     max_cov_points_size: 200
+    # R-VoxelMap parameters
+    use_ransac: true
+    ransac_dist_threshold: 0.05
+    ransac_inlier_ratio: 0.5
+    ransac_iterations: 50
+    validity_check_n: 5
 
 noise_model:
     ranging_cov: 0.05
