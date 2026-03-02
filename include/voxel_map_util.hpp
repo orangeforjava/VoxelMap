@@ -11,6 +11,10 @@
 #include <rosbag/bag.h>
 #include <stdio.h>
 #include <string>
+#include <map>
+#include <queue>
+#include <random>
+#include <set>
 #include <unordered_map>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
@@ -106,6 +110,15 @@ public:
   bool init_octo_;
   bool update_cov_enable_;
   bool update_enable_;
+
+  // R-VoxelMap parameters
+  bool use_ransac_;
+  double ransac_dist_threshold_;
+  double ransac_inlier_ratio_;
+  int ransac_iterations_;
+  int validity_check_n_;
+  double voxel_size_;
+
   OctoTree(int max_layer, int layer, std::vector<int> layer_point_size,
            int max_point_size, int max_cov_points_size, float planer_threshold)
       : max_layer_(max_layer), layer_(layer),
@@ -126,6 +139,13 @@ public:
       leaves_[i] = nullptr;
     }
     plane_ptr_ = new Plane;
+    // R-VoxelMap defaults (disabled by default)
+    use_ransac_ = false;
+    ransac_dist_threshold_ = 0.1;
+    ransac_inlier_ratio_ = 0.5;
+    ransac_iterations_ = 50;
+    validity_check_n_ = 5;
+    voxel_size_ = 1.0;
   }
 
   // check is plane , calc plane parameters including plane covariance
@@ -309,18 +329,24 @@ public:
 
   void init_octo_tree() {
     if (temp_points_.size() > max_plane_update_threshold_) {
-      init_plane(temp_points_, plane_ptr_);
-      if (plane_ptr_->is_plane == true) {
-        octo_state_ = 0;
-        if (temp_points_.size() > max_cov_points_size_) {
-          update_cov_enable_ = false;
-        }
-        if (temp_points_.size() > max_points_size_) {
-          update_enable_ = false;
-        }
+      if (use_ransac_) {
+        // R-VoxelMap: recursive construction with RANSAC
+        recursive_init(temp_points_);
       } else {
-        octo_state_ = 1;
-        cut_octo_tree();
+        // Original VoxelMap construction
+        init_plane(temp_points_, plane_ptr_);
+        if (plane_ptr_->is_plane == true) {
+          octo_state_ = 0;
+          if (temp_points_.size() > max_cov_points_size_) {
+            update_cov_enable_ = false;
+          }
+          if (temp_points_.size() > max_points_size_) {
+            update_enable_ = false;
+          }
+        } else {
+          octo_state_ = 1;
+          cut_octo_tree();
+        }
       }
       init_octo_ = true;
       new_points_num_ = 0;
@@ -378,6 +404,281 @@ public:
     }
   }
 
+  // ==================== R-VoxelMap Methods ====================
+
+  // RANSAC plane fitting: separate inliers from outliers
+  void ransac_fit(const std::vector<pointWithCov> &points,
+                  std::vector<int> &inlier_idx,
+                  std::vector<int> &outlier_idx) {
+    int n = points.size();
+    if (n < 3) {
+      for (int i = 0; i < n; i++) outlier_idx.push_back(i);
+      return;
+    }
+
+    int best_inlier_count = 0;
+    Eigen::Vector3d best_normal = Eigen::Vector3d::Zero();
+    double best_d = 0;
+
+    static thread_local std::mt19937 rng(42);
+    std::uniform_int_distribution<int> dist(0, n - 1);
+
+    for (int iter = 0; iter < ransac_iterations_; iter++) {
+      int i1 = dist(rng);
+      int i2, i3;
+      do { i2 = dist(rng); } while (i2 == i1);
+      do { i3 = dist(rng); } while (i3 == i1 || i3 == i2);
+
+      Eigen::Vector3d v1 = points[i2].point - points[i1].point;
+      Eigen::Vector3d v2 = points[i3].point - points[i1].point;
+      Eigen::Vector3d normal = v1.cross(v2);
+
+      double norm_val = normal.norm();
+      if (norm_val < 1e-10) continue;
+      normal /= norm_val;
+
+      double d = -normal.dot(points[i1].point);
+
+      int inlier_count = 0;
+      for (int i = 0; i < n; i++) {
+        double distance = fabs(normal.dot(points[i].point) + d);
+        if (distance < ransac_dist_threshold_) {
+          inlier_count++;
+        }
+      }
+
+      if (inlier_count > best_inlier_count) {
+        best_inlier_count = inlier_count;
+        best_normal = normal;
+        best_d = d;
+      }
+    }
+
+    for (int i = 0; i < n; i++) {
+      double distance = fabs(best_normal.dot(points[i].point) + best_d);
+      if (distance < ransac_dist_threshold_) {
+        inlier_idx.push_back(i);
+      } else {
+        outlier_idx.push_back(i);
+      }
+    }
+  }
+
+  // Point distribution-based plane validity check (Section III-C)
+  bool plane_validity_check(const Plane *plane,
+                            const std::vector<pointWithCov> &inliers,
+                            int total_input_size,
+                            std::vector<int> &valid_idx,
+                            std::vector<int> &invalid_idx) {
+    if (inliers.empty()) return false;
+
+    double grid_resolution = 4.0 * quater_length_ / validity_check_n_;
+    if (grid_resolution < 1e-10) return false;
+
+    Eigen::Vector3d u1 = plane->x_normal;
+    Eigen::Vector3d u2 = plane->y_normal;
+    Eigen::Vector3d center = plane->center;
+
+    // Project inliers onto 2D grid
+    std::map<std::pair<int,int>, std::vector<int>> grid;
+    for (int i = 0; i < (int)inliers.size(); i++) {
+      Eigen::Vector3d diff = inliers[i].point - center;
+      int xi = (int)std::floor(diff.dot(u1) / grid_resolution);
+      int yi = (int)std::floor(diff.dot(u2) / grid_resolution);
+      grid[std::make_pair(xi, yi)].push_back(i);
+    }
+
+    // BFS clustering of occupied grids (4-neighbor adjacency)
+    std::set<std::pair<int,int>> visited;
+    int best_cluster_points = 0;
+    std::vector<int> best_cluster_indices;
+
+    for (auto &kv : grid) {
+      if (visited.count(kv.first)) continue;
+
+      std::vector<int> cluster_indices;
+      std::queue<std::pair<int,int>> bfs_queue;
+      bfs_queue.push(kv.first);
+      visited.insert(kv.first);
+
+      while (!bfs_queue.empty()) {
+        std::pair<int,int> cur = bfs_queue.front();
+        bfs_queue.pop();
+
+        auto it = grid.find(cur);
+        if (it != grid.end()) {
+          for (int idx : it->second) {
+            cluster_indices.push_back(idx);
+          }
+        }
+
+        int dx[] = {1, -1, 0, 0};
+        int dy[] = {0, 0, 1, -1};
+        for (int d = 0; d < 4; d++) {
+          std::pair<int,int> neighbor = std::make_pair(
+              cur.first + dx[d], cur.second + dy[d]);
+          if (grid.count(neighbor) && !visited.count(neighbor)) {
+            visited.insert(neighbor);
+            bfs_queue.push(neighbor);
+          }
+        }
+      }
+
+      int total_points_in_cluster = (int)cluster_indices.size();
+      if (total_points_in_cluster > best_cluster_points) {
+        best_cluster_points = total_points_in_cluster;
+        best_cluster_indices = cluster_indices;
+      }
+    }
+
+    // Check if best cluster satisfies inlier ratio (Eq. 8)
+    if ((double)best_cluster_points / total_input_size > ransac_inlier_ratio_) {
+      std::set<int> valid_set(best_cluster_indices.begin(),
+                              best_cluster_indices.end());
+      for (int i = 0; i < (int)inliers.size(); i++) {
+        if (valid_set.count(i)) {
+          valid_idx.push_back(i);
+        } else {
+          invalid_idx.push_back(i);
+        }
+      }
+      return true;
+    } else {
+      for (int i = 0; i < (int)inliers.size(); i++) {
+        invalid_idx.push_back(i);
+      }
+      return false;
+    }
+  }
+
+  // Propagate R-VoxelMap parameters to a child OctoTree
+  void propagate_ransac_params(OctoTree *child) {
+    child->use_ransac_ = use_ransac_;
+    child->ransac_dist_threshold_ = ransac_dist_threshold_;
+    child->ransac_inlier_ratio_ = ransac_inlier_ratio_;
+    child->ransac_iterations_ = ransac_iterations_;
+    child->validity_check_n_ = validity_check_n_;
+    child->voxel_size_ = voxel_size_;
+  }
+
+  // Subdivide outlier points into child octree nodes
+  void subdivide_outliers(const std::vector<pointWithCov> &outliers) {
+    if (layer_ >= max_layer_) return;
+    for (size_t pi = 0; pi < outliers.size(); pi++) {
+      const auto &p = outliers[pi];
+      int xyz[3] = {0, 0, 0};
+      if (p.point[0] > voxel_center_[0]) xyz[0] = 1;
+      if (p.point[1] > voxel_center_[1]) xyz[1] = 1;
+      if (p.point[2] > voxel_center_[2]) xyz[2] = 1;
+      int leafnum = 4 * xyz[0] + 2 * xyz[1] + xyz[2];
+
+      if (leaves_[leafnum] == nullptr) {
+        leaves_[leafnum] = new OctoTree(
+            max_layer_, layer_ + 1, layer_point_size_, max_points_size_,
+            max_cov_points_size_, planer_threshold_);
+        leaves_[leafnum]->voxel_center_[0] =
+            voxel_center_[0] + (2 * xyz[0] - 1) * quater_length_;
+        leaves_[leafnum]->voxel_center_[1] =
+            voxel_center_[1] + (2 * xyz[1] - 1) * quater_length_;
+        leaves_[leafnum]->voxel_center_[2] =
+            voxel_center_[2] + (2 * xyz[2] - 1) * quater_length_;
+        leaves_[leafnum]->quater_length_ = quater_length_ / 2;
+        propagate_ransac_params(leaves_[leafnum]);
+      }
+      leaves_[leafnum]->temp_points_.push_back(p);
+      leaves_[leafnum]->new_points_num_++;
+    }
+
+    // Recursively process children that have enough points
+    for (int i = 0; i < 8; i++) {
+      if (leaves_[i] != nullptr) {
+        if (leaves_[i]->temp_points_.size() >
+            (size_t)leaves_[i]->max_plane_update_threshold_) {
+          leaves_[i]->recursive_init(leaves_[i]->temp_points_);
+          leaves_[i]->init_octo_ = true;
+          leaves_[i]->new_points_num_ = 0;
+        }
+      }
+    }
+  }
+
+  // R-VoxelMap recursive octree construction (Algorithm 1)
+  void recursive_init(const std::vector<pointWithCov> &points) {
+    std::vector<pointWithCov> outliers;
+
+    if (points.size() < 3) {
+      outliers.insert(outliers.end(), points.begin(), points.end());
+      octo_state_ = 1;
+    } else {
+      // Step 1: RANSAC plane fitting
+      std::vector<int> inlier_idx, outlier_idx;
+      ransac_fit(points, inlier_idx, outlier_idx);
+
+      double inlier_ratio = (double)inlier_idx.size() / points.size();
+
+      if (inlier_ratio > ransac_inlier_ratio_) {
+        // Step 2: Fit plane from inliers
+        std::vector<pointWithCov> inliers;
+        for (int i : inlier_idx) inliers.push_back(points[i]);
+
+        init_plane(inliers, plane_ptr_);
+
+        if (plane_ptr_->min_eigen_value < planer_threshold_) {
+          // Step 3: Plane validity check
+          std::vector<int> valid_idx, invalid_idx;
+          bool valid = plane_validity_check(plane_ptr_, inliers,
+              (int)points.size(), valid_idx, invalid_idx);
+
+          if (valid && !valid_idx.empty()) {
+            // Collect outliers (RANSAC outliers + invalid inliers)
+            for (int i : outlier_idx) outliers.push_back(points[i]);
+            for (int i : invalid_idx) outliers.push_back(inliers[i]);
+
+            // Refit plane from valid inliers only
+            std::vector<pointWithCov> valid_points;
+            for (int i : valid_idx) valid_points.push_back(inliers[i]);
+            init_plane(valid_points, plane_ptr_);
+
+            // Store valid points for future incremental updates
+            temp_points_ = valid_points;
+            octo_state_ = 0;
+
+            if (temp_points_.size() > (size_t)max_cov_points_size_) {
+              update_cov_enable_ = false;
+            }
+            if (temp_points_.size() > (size_t)max_points_size_) {
+              update_enable_ = false;
+            }
+          } else {
+            // Validity check failed
+            plane_ptr_->is_plane = false;
+            outliers.clear();
+            outliers.insert(outliers.end(), points.begin(), points.end());
+            octo_state_ = 1;
+          }
+        } else {
+          // Eigenvalue too large (Algorithm 1, line 14-15)
+          plane_ptr_->is_plane = false;
+          outliers.clear();
+          outliers.insert(outliers.end(), points.begin(), points.end());
+          octo_state_ = 1;
+        }
+      } else {
+        // Inlier ratio too low (Algorithm 1, line 17-18)
+        plane_ptr_->is_plane = false;
+        outliers.insert(outliers.end(), points.begin(), points.end());
+        octo_state_ = 1;
+      }
+    }
+
+    // Step 4: Subdivide outliers and recursively process
+    if (!outliers.empty() && layer_ < max_layer_) {
+      subdivide_outliers(outliers);
+    }
+  }
+
+  // ==================== End R-VoxelMap Methods ====================
+
   void UpdateOctoTree(const pointWithCov &pv) {
     if (!init_octo_) {
       new_points_num_++;
@@ -388,6 +689,36 @@ public:
       }
     } else {
       if (plane_ptr_->is_plane) {
+        // R-VoxelMap: check if point is far from plane, route to children
+        if (use_ransac_ && layer_ < max_layer_) {
+          double point_to_plane_dist = fabs(
+              plane_ptr_->normal.dot(pv.point - plane_ptr_->center));
+          if (point_to_plane_dist > ransac_dist_threshold_) {
+            int xyz[3] = {0, 0, 0};
+            if (pv.point[0] > voxel_center_[0]) xyz[0] = 1;
+            if (pv.point[1] > voxel_center_[1]) xyz[1] = 1;
+            if (pv.point[2] > voxel_center_[2]) xyz[2] = 1;
+            int leafnum = 4 * xyz[0] + 2 * xyz[1] + xyz[2];
+            if (leaves_[leafnum] != nullptr) {
+              leaves_[leafnum]->UpdateOctoTree(pv);
+            } else {
+              leaves_[leafnum] = new OctoTree(
+                  max_layer_, layer_ + 1, layer_point_size_, max_points_size_,
+                  max_cov_points_size_, planer_threshold_);
+              leaves_[leafnum]->layer_point_size_ = layer_point_size_;
+              leaves_[leafnum]->voxel_center_[0] =
+                  voxel_center_[0] + (2 * xyz[0] - 1) * quater_length_;
+              leaves_[leafnum]->voxel_center_[1] =
+                  voxel_center_[1] + (2 * xyz[1] - 1) * quater_length_;
+              leaves_[leafnum]->voxel_center_[2] =
+                  voxel_center_[2] + (2 * xyz[2] - 1) * quater_length_;
+              leaves_[leafnum]->quater_length_ = quater_length_ / 2;
+              propagate_ransac_params(leaves_[leafnum]);
+              leaves_[leafnum]->UpdateOctoTree(pv);
+            }
+            return;
+          }
+        }
         if (update_enable_) {
           new_points_num_++;
           all_points_num_++;
@@ -447,6 +778,9 @@ public:
             leaves_[leafnum]->voxel_center_[2] =
                 voxel_center_[2] + (2 * xyz[2] - 1) * quater_length_;
             leaves_[leafnum]->quater_length_ = quater_length_ / 2;
+            if (use_ransac_) {
+              propagate_ransac_params(leaves_[leafnum]);
+            }
             leaves_[leafnum]->UpdateOctoTree(pv);
           }
         } else {
@@ -530,7 +864,12 @@ void buildVoxelMap(const std::vector<pointWithCov> &input_points,
                    const std::vector<int> &layer_point_size,
                    const int max_points_size, const int max_cov_points_size,
                    const float planer_threshold,
-                   std::unordered_map<VOXEL_LOC, OctoTree *> &feat_map) {
+                   std::unordered_map<VOXEL_LOC, OctoTree *> &feat_map,
+                   bool use_ransac = false,
+                   double ransac_dist_threshold = 0.1,
+                   double ransac_inlier_ratio = 0.5,
+                   int ransac_iterations = 50,
+                   int validity_check_n = 5) {
   uint plsize = input_points.size();
   for (uint i = 0; i < plsize; i++) {
     const pointWithCov p_v = input_points[i];
@@ -559,6 +898,13 @@ void buildVoxelMap(const std::vector<pointWithCov> &input_points,
       feat_map[position]->temp_points_.push_back(p_v);
       feat_map[position]->new_points_num_++;
       feat_map[position]->layer_point_size_ = layer_point_size;
+      // Set R-VoxelMap parameters
+      feat_map[position]->use_ransac_ = use_ransac;
+      feat_map[position]->ransac_dist_threshold_ = ransac_dist_threshold;
+      feat_map[position]->ransac_inlier_ratio_ = ransac_inlier_ratio;
+      feat_map[position]->ransac_iterations_ = ransac_iterations;
+      feat_map[position]->validity_check_n_ = validity_check_n;
+      feat_map[position]->voxel_size_ = voxel_size;
     }
   }
   for (auto iter = feat_map.begin(); iter != feat_map.end(); ++iter) {
@@ -571,7 +917,12 @@ void updateVoxelMap(const std::vector<pointWithCov> &input_points,
                     const std::vector<int> &layer_point_size,
                     const int max_points_size, const int max_cov_points_size,
                     const float planer_threshold,
-                    std::unordered_map<VOXEL_LOC, OctoTree *> &feat_map) {
+                    std::unordered_map<VOXEL_LOC, OctoTree *> &feat_map,
+                    bool use_ransac = false,
+                    double ransac_dist_threshold = 0.1,
+                    double ransac_inlier_ratio = 0.5,
+                    int ransac_iterations = 50,
+                    int validity_check_n = 5) {
   uint plsize = input_points.size();
   for (uint i = 0; i < plsize; i++) {
     const pointWithCov p_v = input_points[i];
@@ -596,6 +947,13 @@ void updateVoxelMap(const std::vector<pointWithCov> &input_points,
       feat_map[position]->voxel_center_[0] = (0.5 + position.x) * voxel_size;
       feat_map[position]->voxel_center_[1] = (0.5 + position.y) * voxel_size;
       feat_map[position]->voxel_center_[2] = (0.5 + position.z) * voxel_size;
+      // Set R-VoxelMap parameters
+      feat_map[position]->use_ransac_ = use_ransac;
+      feat_map[position]->ransac_dist_threshold_ = ransac_dist_threshold;
+      feat_map[position]->ransac_inlier_ratio_ = ransac_inlier_ratio;
+      feat_map[position]->ransac_iterations_ = ransac_iterations;
+      feat_map[position]->validity_check_n_ = validity_check_n;
+      feat_map[position]->voxel_size_ = voxel_size;
       feat_map[position]->UpdateOctoTree(p_v);
     }
   }
@@ -626,6 +984,8 @@ void build_single_residual(const pointWithCov &pv, const OctoTree *current_octo,
                            double &prob, ptpl &single_ptpl) {
   double radius_k = 3;
   Eigen::Vector3d p_w = pv.point_world;
+
+  // Check current node's plane
   if (current_octo->plane_ptr_->is_plane) {
     Plane &plane = *current_octo->plane_ptr_;
     Eigen::Vector3d p_world_to_center = p_w - plane.center;
@@ -659,29 +1019,18 @@ void build_single_residual(const pointWithCov &pv, const OctoTree *current_octo,
           single_ptpl.d = plane.d;
           single_ptpl.layer = current_layer;
         }
-        return;
-      } else {
-        // is_sucess = false;
-        return;
       }
-    } else {
-      // is_sucess = false;
-      return;
     }
-  } else {
-    if (current_layer < max_layer) {
-      for (size_t leafnum = 0; leafnum < 8; leafnum++) {
-        if (current_octo->leaves_[leafnum] != nullptr) {
+  }
 
-          OctoTree *leaf_octo = current_octo->leaves_[leafnum];
-          build_single_residual(pv, leaf_octo, current_layer + 1, max_layer,
-                                sigma_num, is_sucess, prob, single_ptpl);
-        }
+  // R-VoxelMap: always check children (a node may have both plane and children)
+  if (current_layer < max_layer) {
+    for (size_t leafnum = 0; leafnum < 8; leafnum++) {
+      if (current_octo->leaves_[leafnum] != nullptr) {
+        OctoTree *leaf_octo = current_octo->leaves_[leafnum];
+        build_single_residual(pv, leaf_octo, current_layer + 1, max_layer,
+                              sigma_num, is_sucess, prob, single_ptpl);
       }
-      return;
-    } else {
-      // is_sucess = false;
-      return;
     }
   }
 }
@@ -695,12 +1044,11 @@ void GetUpdatePlane(const OctoTree *current_octo, const int pub_max_voxel_layer,
     plane_list.push_back(*current_octo->plane_ptr_);
   }
   if (current_octo->layer_ < current_octo->max_layer_) {
-    if (!current_octo->plane_ptr_->is_plane) {
-      for (size_t i = 0; i < 8; i++) {
-        if (current_octo->leaves_[i] != nullptr) {
-          GetUpdatePlane(current_octo->leaves_[i], pub_max_voxel_layer,
-                         plane_list);
-        }
+    // R-VoxelMap: always recurse into children (node may have plane + children)
+    for (size_t i = 0; i < 8; i++) {
+      if (current_octo->leaves_[i] != nullptr) {
+        GetUpdatePlane(current_octo->leaves_[i], pub_max_voxel_layer,
+                       plane_list);
       }
     }
   }

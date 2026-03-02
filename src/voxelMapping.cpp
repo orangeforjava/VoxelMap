@@ -58,6 +58,13 @@ int max_points_size = 50;
 double sigma_num = 2.0;
 double max_voxel_size = 1.0;
 std::vector<int> layer_size;
+
+// R-VoxelMap params
+bool use_ransac = false;
+double ransac_dist_threshold = 0.1;
+double ransac_inlier_ratio = 0.5;
+int ransac_iterations = 50;
+int validity_check_n = 5;
 // Eigen::Vector3d layer_size(20, 10, 10);
 // avia
 // velodyne
@@ -543,6 +550,13 @@ int main(int argc, char **argv) {
   // std::cout << "filter_size_surf_min:" << filter_size_surf_min << std::endl;
   nh.param<double>("mapping/plannar_threshold", min_eigen_value, 0.01);
 
+  // R-VoxelMap params
+  nh.param<bool>("mapping/use_ransac", use_ransac, false);
+  nh.param<double>("mapping/ransac_dist_threshold", ransac_dist_threshold, 0.1);
+  nh.param<double>("mapping/ransac_inlier_ratio", ransac_inlier_ratio, 0.5);
+  nh.param<int>("mapping/ransac_iterations", ransac_iterations, 50);
+  nh.param<int>("mapping/validity_check_n", validity_check_n, 5);
+
   // preprocess params
   nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
   nh.param<bool>("preprocess/calib_laser", calib_laser, false);
@@ -740,7 +754,9 @@ int main(int argc, char **argv) {
 
         buildVoxelMap(pv_list, max_voxel_size, max_layer, layer_size,
                       max_points_size, max_points_size, min_eigen_value,
-                      voxel_map);
+                      voxel_map, use_ransac, ransac_dist_threshold,
+                      ransac_inlier_ratio, ransac_iterations,
+                      validity_check_n);
         std::cout << "build voxel map" << std::endl;
         if (write_kitti_log) {
           kitti_log(fp_kitti);
@@ -1046,7 +1062,9 @@ int main(int argc, char **argv) {
       std::sort(pv_list.begin(), pv_list.end(), var_contrast);
       updateVoxelMap(pv_list, max_voxel_size, max_layer, layer_size,
                      max_points_size, max_points_size, min_eigen_value,
-                     voxel_map);
+                     voxel_map, use_ransac, ransac_dist_threshold,
+                     ransac_inlier_ratio, ransac_iterations,
+                     validity_check_n);
       auto map_incremental_end = std::chrono::high_resolution_clock::now();
       map_incremental_time =
           std::chrono::duration_cast<std::chrono::duration<double>>(
