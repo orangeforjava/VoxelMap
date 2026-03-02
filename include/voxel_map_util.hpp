@@ -420,6 +420,7 @@ public:
     Eigen::Vector3d best_normal = Eigen::Vector3d::Zero();
     double best_d = 0;
 
+    // Fixed seed for deterministic reproducibility (see R-VoxelMap paper Table VII)
     static thread_local std::mt19937 rng(42);
     std::uniform_int_distribution<int> dist(0, n - 1);
 
@@ -464,7 +465,10 @@ public:
     }
   }
 
-  // Point distribution-based plane validity check (Section III-C)
+  // Verifies plane consistency by projecting inlier points onto a 2D reference
+  // plane, discretizing into a grid, clustering connected grid cells via BFS,
+  // and selecting the largest cluster. Prevents erroneous merging of spatially
+  // separated physical planes.
   bool plane_validity_check(const Plane *plane,
                             const std::vector<pointWithCov> &inliers,
                             int total_input_size,
@@ -472,6 +476,7 @@ public:
                             std::vector<int> &invalid_idx) {
     if (inliers.empty()) return false;
 
+    // Grid resolution r = voxel_size / n, where voxel_size = 4 * quater_length_
     double grid_resolution = 4.0 * quater_length_ / validity_check_n_;
     if (grid_resolution < 1e-10) return false;
 
@@ -531,7 +536,8 @@ public:
       }
     }
 
-    // Check if best cluster satisfies inlier ratio (Eq. 8)
+    // Check if best cluster satisfies inlier ratio (Eq. 8: |Ibest|/|Pin| > pth)
+    // Uses total_input_size (|Pin|) per paper specification, not just inlier count
     if ((double)best_cluster_points / total_input_size > ransac_inlier_ratio_) {
       std::set<int> valid_set(best_cluster_indices.begin(),
                               best_cluster_indices.end());
